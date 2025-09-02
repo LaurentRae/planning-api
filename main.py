@@ -1,20 +1,25 @@
 import os, json
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple
+from typing import List, Dict, Tuple, Optional, Literal
 from tempfile import NamedTemporaryFile
 
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI, UploadFile, File, Body
 from fastapi.responses import Response, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from icalendar import Calendar, Event
 from ortools.sat.python import cp_model
 from dotenv import load_dotenv
 
 load_dotenv()
 
-# -----------------------------
+# =========================
 # Modèles et utilitaires
-# -----------------------------
+# =========================
+AM_START, AM_END = "08:00", "12:00"
+PM_START, PM_END = "13:00", "17:00"
+
+DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]  # 0..6
+
 class Employee(BaseModel):
     first_name: str
     roles: List[str]
@@ -56,28 +61,54 @@ def is_within_availability(first_name: str, sh: Shift, all_avail: Dict[str, Dict
             return True
     return False
 
+def week_dates(week_monday: str) -> List[str]:
+    wd = datetime.fromisoformat(week_monday)
+    return [(wd + timedelta(days=i)).date().isoformat() for i in range(7)]
+
+def slot_tuple(kind: Literal["AM","PM"]) -> Tuple[str,str]:
+    return (AM_START, AM_END) if kind == "AM" else (PM_START, PM_END)
+
+def add_slot(avmap: Dict[str, List[List[str]]], date: str, start: str, end: str):
+    avmap.setdefault(date, [])
+    if [start, end] not in avmap[date]:
+        avmap[date].append([start, end])
+
+def remove_slot(avmap: Dict[str, List[List[str]]], date: str, start: str, end: str):
+    slots = avmap.get(date, [])
+    new_slots = [s for s in slots if not (s[0] == start and s[1] == end)]
+    if new_slots:
+        avmap[date] = new_slots
+    elif date in avmap:
+        del avmap[date]
+
+def is_open(date_iso: str, kind: Literal["AM","PM"]) -> bool:
+    d = datetime.fromisoformat(date_iso)
+    wd = d.weekday() # 0=lundi, 2=mercredi
+    # fermé lundi matin, mercredi après-midi
+    if kind == "AM" and wd == 0:
+        return False
+    if kind == "PM" and wd == 2:
+        return False
+    return True
+
 def generate_shifts_for_week(week_monday: str) -> List[Shift]:
     """
     Génère 2 shifts/jour (08:00–12:00 et 13:00–17:00) pour 7 jours,
     SAUF lundi matin (fermé) et mercredi après-midi (fermé).
     Rôle unique 'service' pour simplifier.
     """
-    wd = datetime.fromisoformat(week_monday)
+    dates = week_dates(week_monday)
     shifts: List[Shift] = []
-    for i in range(7):
-      d = (wd + timedelta(days=i)).date().isoformat()
-      weekday = (wd + timedelta(days=i)).weekday()  # 0=lundi ... 2=mercredi
-      # matin (sauf lundi)
-      if not (weekday == 0):  # pas le lundi matin
-          shifts.append(Shift(date=d, start="08:00", end="12:00", role="service"))
-      # après-midi (sauf mercredi)
-      if not (weekday == 2):  # pas le mercredi après-midi
-          shifts.append(Shift(date=d, start="13:00", end="17:00", role="service"))
+    for d in dates:
+        if is_open(d, "AM"):
+            shifts.append(Shift(date=d, start=AM_START, end=AM_END, role="service"))
+        if is_open(d, "PM"):
+            shifts.append(Shift(date=d, start=PM_START, end=PM_END, role="service"))
     return shifts
 
-# -----------------------------
+# =========================
 # Solveur CP-SAT (OR-Tools)
-# -----------------------------
+# =========================
 def build_schedule(employees: List[Employee],
                    avail: Dict[str, Dict],
                    shifts: List[Shift]) -> List[Tuple[str, Shift]]:
@@ -132,52 +163,9 @@ def build_schedule(employees: List[Employee],
                 assignments.append((emp_names[ei], shifts[si]))
     return assignments
 
-# -----------------------------
-# Assistant (texte -> actions)
-# -----------------------------
-SYSTEM_PROMPT = """Tu es un assistant de planification.
-À partir d’un texte FR informel (dicté), extrais des actions JSON strictement.
-Schéma:
-{
-  "employees": [{"first_name":"Prénom","roles":["role1"],"max_hours_per_week":24,"min_rest_hours":11}],
-  "availability": [{"first_name":"Prénom","slots_by_date":{"YYYY-MM-DD":[["HH:MM","HH:MM"]]}}],
-  "build_schedule": {"week_start":"YYYY-MM-DD"}  // optionnel
-}
-Toujours retourner du JSON valide sans texte autour.
-"""
-
-def gpt_extract_actions(text: str) -> dict:
-    import openai
-    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role":"system","content":SYSTEM_PROMPT},
-            {"role":"user","content":text}
-        ],
-        temperature=0
-    )
-    content = resp.choices[0].message.content
-    try:
-        return json.loads(content)
-    except Exception:
-        return {"employees": [], "availability": [], "build_schedule": None}
-
-def handle_instruction_text(text: str) -> dict:
-    actions = gpt_extract_actions(text)
-    # appliquer localement (DB en mémoire)
-    for emp in actions.get("employees", []):
-        add_or_replace_employee(Employee(**emp))
-    for av in actions.get("availability", []):
-        set_availability(Availability(**av))
-    if actions.get("build_schedule"):
-        build_schedule_api(actions["build_schedule"]["week_start"])
-    return {"ok": True, "applied": actions}
-
-# -----------------------------
+# =========================
 # “Base de données” en mémoire
-# -----------------------------
+# =========================
 DB = {
     "employees": [],          # List[Employee]
     "avail": {},              # { first_name: {date: [[start,end], ...]}}
@@ -196,9 +184,148 @@ def build_schedule_api(week_start: str):
     DB["shifts_last"] = shifts
     DB["assignments"] = build_schedule(DB["employees"], DB["avail"], shifts)
 
-# -----------------------------
+# =========================
+# Assistant (texte -> actions)
+# =========================
+SYSTEM_PROMPT = """Tu es un assistant de planification pour une API strictement définie.
+Tu DOIS convertir des phrases FR en un JSON d'actions. AUCUNE navigation web.
+Règles d'ouverture: créneaux 08:00–12:00 (AM) et 13:00–17:00 (PM).
+Fermé: lundi matin (AM) et mercredi après-midi (PM).
+
+Schéma JSON à produire (champs optionnels autorisés):
+{
+  "employees": [ { "first_name":"Prénom", "roles":["service"], "max_hours_per_week":40, "min_rest_hours":11 } ],
+  "availability": [ { "first_name":"Prénom", "slots_by_date": { "YYYY-MM-DD": [["HH:MM","HH:MM"]]} } ],
+  "recurring": [ {
+     "first_name":"Prénom",
+     "week_start":"YYYY-MM-DD",
+     "include": { "AM": true/false, "PM": true/false, "days": ["mon","tue","wed","thu","fri","sat","sun"] },
+     "except_days": ["fri","sat"]   // optionnel
+  } ],
+  "swap": [ { "date":"YYYY-MM-DD", "slot":"AM|PM", "out":"Prénom", "in":"Prénom" } ],
+  "build_schedule": { "week_start":"YYYY-MM-DD" } // si non fourni, ne pas construire
+}
+
+Exemples d'interprétation:
+- "XX est disponible tous les matins sauf le vendredi, semaine du 8 sept":
+  -> recurring: {first_name:"XX", week_start:"2025-09-08", include:{AM:true, PM:false, days:["mon","tue","wed","thu","fri","sat","sun"]}, except_days:["fri"]}
+
+- "remplace XX par YY le jeudi après-midi (semaine du 8 sept)":
+  -> swap: [{date:"2025-09-11", slot:"PM", out:"XX", in:"YY"}]
+
+- "ajoute ZZ à l'équipe":
+  -> employees: [{first_name:"ZZ", roles:["service"]}]
+
+Toujours retourner UNIQUEMENT un JSON valide.
+"""
+
+def gpt_extract_actions(text: str) -> dict:
+    import openai
+    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role":"system","content":SYSTEM_PROMPT},
+            {"role":"user","content":text}
+        ],
+        temperature=0
+    )
+    content = resp.choices[0].message.content
+    try:
+        return json.loads(content)
+    except Exception:
+        return {"employees": [], "availability": [], "recurring": [], "swap": [], "build_schedule": None}
+
+def expand_recurring(rule: dict) -> Dict[str, List[List[str]]]:
+    """
+    Transforme une règle 'recurring' en slots_by_date.
+    Prend en compte les fermetures (lundi AM, mercredi PM).
+    """
+    first_name = rule["first_name"]
+    week_start = rule["week_start"]
+    include = rule.get("include", {})
+    include_am = bool(include.get("AM", False))
+    include_pm = bool(include.get("PM", False))
+    days = include.get("days", DOW)
+    except_days = set(rule.get("except_days", []))
+
+    slots: Dict[str, List[List[str]]] = {}
+    for i, date_iso in enumerate(week_dates(week_start)):
+        dow = DOW[i]
+        if dow in except_days or dow not in days:
+            continue
+        if include_am and is_open(date_iso, "AM"):
+            add_slot(slots, date_iso, AM_START, AM_END)
+        if include_pm and is_open(date_iso, "PM"):
+            add_slot(slots, date_iso, PM_START, PM_END)
+    return slots
+
+def apply_actions(actions: dict) -> dict:
+    # 1) employees
+    for emp in actions.get("employees", []) or []:
+        if "roles" not in emp or not emp["roles"]:
+            emp["roles"] = ["service"]
+        add_or_replace_employee(Employee(**emp))
+
+    # 2) availability (dates explicites)
+    for av in actions.get("availability", []) or []:
+        cur = DB["avail"].get(av["first_name"], {})
+        # fusionner (replace=ON par défaut ici; si tu préfères fusion additive, remplace par cur.update(...))
+        DB["avail"][av["first_name"]] = av["slots_by_date"]
+
+    # 3) recurring -> expand to explicit dates
+    for ru in actions.get("recurring", []) or []:
+        name = ru["first_name"]
+        expanded = expand_recurring(ru)
+        cur = DB["avail"].get(name, {})
+        # fusion additive
+        for d, slots in expanded.items():
+            cur.setdefault(d, [])
+            for s in slots:
+                if s not in cur[d]:
+                    cur[d].append(s)
+        DB["avail"][name] = cur
+
+    # 4) swap -> rendre indisponible 'out' et dispo 'in' sur le créneau ciblé
+    for sw in actions.get("swap", []) or []:
+        date = sw["date"]
+        start, end = slot_tuple(sw["slot"])
+        out_name = sw["out"]
+        in_name = sw["in"]
+
+        # out: retirer le slot
+        av_out = DB["avail"].get(out_name, {})
+        remove_slot(av_out, date, start, end)
+        DB["avail"][out_name] = av_out
+
+        # in: ajouter le slot (si ouvert)
+        if is_open(date, sw["slot"]):
+            av_in = DB["avail"].get(in_name, {})
+            add_slot(av_in, date, start, end)
+            DB["avail"][in_name] = av_in
+
+    # 5) build ? (si demandé)
+    built = None
+    if actions.get("build_schedule"):
+        week_start = actions["build_schedule"]["week_start"]
+        build_schedule_api(week_start)
+        built = {"assigned": len(DB["assignments"]), "week_start": week_start}
+
+    return {
+        "ok": True,
+        "employees": [e.model_dump() for e in DB["employees"]],
+        "avail": DB["avail"],
+        "built": built
+    }
+
+def handle_instruction_text(text: str) -> dict:
+    actions = gpt_extract_actions(text)
+    return {"applied": apply_actions(actions), "parsed": actions}
+
+# =========================
 # FastAPI
-# -----------------------------
+# =========================
 app = FastAPI(title="AutoPlanner")
 
 @app.post("/add_employee")
@@ -257,3 +384,19 @@ async def upload_audio(file: UploadFile = File(...)):
 
     result = handle_instruction_text(transcript)
     return JSONResponse({"transcript": transcript, "result": result})
+
+# --- NLP direct: phrase(s) -> actions -> application
+class NLPRequest(BaseModel):
+    text: str = Field(..., description="Consignes en français")
+@app.post("/nlp")
+def nlp_apply(req: NLPRequest):
+    return handle_instruction_text(req.text)
+
+# --- debug
+@app.get("/state")
+def state():
+    return {
+        "employees": [e.model_dump() for e in DB["employees"]],
+        "avail": DB["avail"],
+        "assigned": len(DB["assignments"])
+    }
