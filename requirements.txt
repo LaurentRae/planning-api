@@ -1,0 +1,9 @@
+fastapi
+uvicorn[standard]
+pydantic
+ortools
+icalendar
+python-dotenv
+requests
+openai
+python-multipart
