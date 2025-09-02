@@ -1,9 +1,9 @@
 import os, json
 from datetime import datetime, timedelta
-from typing import List, Dict, Tuple, Optional, Literal
+from typing import List, Dict, Tuple, Literal
 from tempfile import NamedTemporaryFile
 
-from fastapi import FastAPI, UploadFile, File, Body
+from fastapi import FastAPI, UploadFile, File
 from fastapi.responses import Response, JSONResponse
 from pydantic import BaseModel, Field
 from icalendar import Calendar, Event
@@ -13,13 +13,22 @@ from dotenv import load_dotenv
 load_dotenv()
 
 # =========================
-# Modèles et utilitaires
+# Config horaires & fermetures
 # =========================
 AM_START, AM_END = "08:00", "12:00"
 PM_START, PM_END = "13:00", "17:00"
 
-DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]  # 0..6
+# 0=lundi ... 6=dimanche
+DOW = ["mon", "tue", "wed", "thu", "fri", "sat", "sun"]
 
+# >>> FERMETURES (adapter librement)
+#   ("mon","AM") = lundi matin fermé
+#   ("wed","AM") = mercredi matin fermé
+CLOSURES = {("mon","AM"), ("wed","AM")}  # <- demandé
+
+# =========================
+# Modèles
+# =========================
 class Employee(BaseModel):
     first_name: str
     roles: List[str]
@@ -37,6 +46,9 @@ class Shift(BaseModel):
     end: str
     role: str
 
+# =========================
+# Utilitaires
+# =========================
 def parse_hm(hm: str):
     h, m = hm.split(":")
     return int(h), int(m)
@@ -48,18 +60,6 @@ def to_dt(date_str: str, hm: str) -> datetime:
 
 def shift_duration_min(sh: Shift) -> int:
     return int((to_dt(sh.date, sh.end) - to_dt(sh.date, sh.start)).total_seconds() // 60)
-
-def is_within_availability(first_name: str, sh: Shift, all_avail: Dict[str, Dict[str, List[List[str]]]]) -> bool:
-    a = all_avail.get(first_name, {})
-    slots = a.get(sh.date, [])
-    sh_s = to_dt(sh.date, sh.start)
-    sh_e = to_dt(sh.date, sh.end)
-    for s, e in slots:
-        s_dt = to_dt(sh.date, s)
-        e_dt = to_dt(sh.date, e)
-        if s_dt <= sh_s and sh_e <= e_dt:
-            return True
-    return False
 
 def week_dates(week_monday: str) -> List[str]:
     wd = datetime.fromisoformat(week_monday)
@@ -83,19 +83,26 @@ def remove_slot(avmap: Dict[str, List[List[str]]], date: str, start: str, end: s
 
 def is_open(date_iso: str, kind: Literal["AM","PM"]) -> bool:
     d = datetime.fromisoformat(date_iso)
-    wd = d.weekday() # 0=lundi, 2=mercredi
-    # fermé lundi matin, mercredi après-midi
-    if kind == "AM" and wd == 0:
-        return False
-    if kind == "PM" and wd == 2:
-        return False
-    return True
+    wd_name = DOW[d.weekday()]  # "mon","tue",...
+    return (wd_name, kind) not in CLOSURES
+
+def is_within_availability(first_name: str, sh: Shift, all_avail: Dict[str, Dict[str, List[List[str]]]]) -> bool:
+    a = all_avail.get(first_name, {})
+    slots = a.get(sh.date, [])
+    sh_s = to_dt(sh.date, sh.start)
+    sh_e = to_dt(sh.date, sh.end)
+    for s, e in slots:
+        s_dt = to_dt(sh.date, s)
+        e_dt = to_dt(sh.date, e)
+        if s_dt <= sh_s and sh_e <= e_dt:
+            return True
+    return False
 
 def generate_shifts_for_week(week_monday: str) -> List[Shift]:
     """
     Génère 2 shifts/jour (08:00–12:00 et 13:00–17:00) pour 7 jours,
-    SAUF lundi matin (fermé) et mercredi après-midi (fermé).
-    Rôle unique 'service' pour simplifier.
+    en respectant les FERMETURES dans CLOSURES.
+    Rôle unique 'service'.
     """
     dates = week_dates(week_monday)
     shifts: List[Shift] = []
@@ -185,38 +192,33 @@ def build_schedule_api(week_start: str):
     DB["assignments"] = build_schedule(DB["employees"], DB["avail"], shifts)
 
 # =========================
-# Assistant (texte -> actions)
+# Assistant (NLP -> actions)
 # =========================
-SYSTEM_PROMPT = """Tu es un assistant de planification pour une API strictement définie.
-Tu DOIS convertir des phrases FR en un JSON d'actions. AUCUNE navigation web.
-Règles d'ouverture: créneaux 08:00–12:00 (AM) et 13:00–17:00 (PM).
-Fermé: lundi matin (AM) et mercredi après-midi (PM).
+SYSTEM_PROMPT = """Tu es un assistant de planification pour une API.
+Ne fais AUCUNE navigation web. Retourne UNIQUEMENT un JSON valide suivant ce schéma:
 
-Schéma JSON à produire (champs optionnels autorisés):
 {
   "employees": [ { "first_name":"Prénom", "roles":["service"], "max_hours_per_week":40, "min_rest_hours":11 } ],
-  "availability": [ { "first_name":"Prénom", "slots_by_date": { "YYYY-MM-DD": [["HH:MM","HH:MM"]]} } ],
+  "availability": [ { "first_name":"Prénom", "slots_by_date": { "YYYY-MM-DD": [["HH:MM","HH:MM"]] } } ],
   "recurring": [ {
      "first_name":"Prénom",
      "week_start":"YYYY-MM-DD",
      "include": { "AM": true/false, "PM": true/false, "days": ["mon","tue","wed","thu","fri","sat","sun"] },
-     "except_days": ["fri","sat"]   // optionnel
+     "except_days": ["fri","sat"]
   } ],
   "swap": [ { "date":"YYYY-MM-DD", "slot":"AM|PM", "out":"Prénom", "in":"Prénom" } ],
-  "build_schedule": { "week_start":"YYYY-MM-DD" } // si non fourni, ne pas construire
+  "build_schedule": { "week_start":"YYYY-MM-DD" }
 }
 
-Exemples d'interprétation:
-- "XX est disponible tous les matins sauf le vendredi, semaine du 8 sept":
-  -> recurring: {first_name:"XX", week_start:"2025-09-08", include:{AM:true, PM:false, days:["mon","tue","wed","thu","fri","sat","sun"]}, except_days:["fri"]}
+Règles horaires: AM=08:00–12:00, PM=13:00–17:00. Fermetures à respecter côté serveur.
+Exemples:
+- "XX dispo tous les matins sauf vendredi, semaine du 8 sept" =>
+  {"recurring":[{"first_name":"XX","week_start":"2025-09-08","include":{"AM":true,"PM":false,"days":["mon","tue","wed","thu","fri","sat","sun"]},"except_days":["fri"]}],"build_schedule":{"week_start":"2025-09-08"}}
+- "remplace XX par YY le jeudi après-midi semaine du 8 sept" =>
+  {"swap":[{"date":"2025-09-11","slot":"PM","out":"XX","in":"YY"}],"build_schedule":{"week_start":"2025-09-08"}}
+- "ajoute ZZ à l'équipe" => {"employees":[{"first_name":"ZZ","roles":["service"]}]}
 
-- "remplace XX par YY le jeudi après-midi (semaine du 8 sept)":
-  -> swap: [{date:"2025-09-11", slot:"PM", out:"XX", in:"YY"}]
-
-- "ajoute ZZ à l'équipe":
-  -> employees: [{first_name:"ZZ", roles:["service"]}]
-
-Toujours retourner UNIQUEMENT un JSON valide.
+Toujours retourner du JSON, sans texte autour.
 """
 
 def gpt_extract_actions(text: str) -> dict:
@@ -225,10 +227,7 @@ def gpt_extract_actions(text: str) -> dict:
     resp = client.chat.completions.create(
         model="gpt-4o-mini",
         response_format={"type": "json_object"},
-        messages=[
-            {"role":"system","content":SYSTEM_PROMPT},
-            {"role":"user","content":text}
-        ],
+        messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":text}],
         temperature=0
     )
     content = resp.choices[0].message.content
@@ -238,11 +237,7 @@ def gpt_extract_actions(text: str) -> dict:
         return {"employees": [], "availability": [], "recurring": [], "swap": [], "build_schedule": None}
 
 def expand_recurring(rule: dict) -> Dict[str, List[List[str]]]:
-    """
-    Transforme une règle 'recurring' en slots_by_date.
-    Prend en compte les fermetures (lundi AM, mercredi PM).
-    """
-    first_name = rule["first_name"]
+    """Transforme une règle 'recurring' en slots_by_date, en respectant CLOSURES."""
     week_start = rule["week_start"]
     include = rule.get("include", {})
     include_am = bool(include.get("AM", False))
@@ -270,16 +265,13 @@ def apply_actions(actions: dict) -> dict:
 
     # 2) availability (dates explicites)
     for av in actions.get("availability", []) or []:
-        cur = DB["avail"].get(av["first_name"], {})
-        # fusionner (replace=ON par défaut ici; si tu préfères fusion additive, remplace par cur.update(...))
         DB["avail"][av["first_name"]] = av["slots_by_date"]
 
-    # 3) recurring -> expand to explicit dates
+    # 3) recurring -> expand to explicit dates (fusion additive)
     for ru in actions.get("recurring", []) or []:
         name = ru["first_name"]
         expanded = expand_recurring(ru)
         cur = DB["avail"].get(name, {})
-        # fusion additive
         for d, slots in expanded.items():
             cur.setdefault(d, [])
             for s in slots:
@@ -287,41 +279,32 @@ def apply_actions(actions: dict) -> dict:
                     cur[d].append(s)
         DB["avail"][name] = cur
 
-    # 4) swap -> rendre indisponible 'out' et dispo 'in' sur le créneau ciblé
+    # 4) swap: rendre indispo 'out' + rendre dispo 'in' sur le créneau
     for sw in actions.get("swap", []) or []:
         date = sw["date"]
         start, end = slot_tuple(sw["slot"])
-        out_name = sw["out"]
-        in_name = sw["in"]
-
-        # out: retirer le slot
+        out_name, in_name = sw["out"], sw["in"]
+        # out
         av_out = DB["avail"].get(out_name, {})
         remove_slot(av_out, date, start, end)
         DB["avail"][out_name] = av_out
-
-        # in: ajouter le slot (si ouvert)
+        # in
         if is_open(date, sw["slot"]):
             av_in = DB["avail"].get(in_name, {})
             add_slot(av_in, date, start, end)
             DB["avail"][in_name] = av_in
 
-    # 5) build ? (si demandé)
     built = None
     if actions.get("build_schedule"):
         week_start = actions["build_schedule"]["week_start"]
         build_schedule_api(week_start)
         built = {"assigned": len(DB["assignments"]), "week_start": week_start}
 
-    return {
-        "ok": True,
-        "employees": [e.model_dump() for e in DB["employees"]],
-        "avail": DB["avail"],
-        "built": built
-    }
+    return {"ok": True, "built": built}
 
 def handle_instruction_text(text: str) -> dict:
     actions = gpt_extract_actions(text)
-    return {"applied": apply_actions(actions), "parsed": actions}
+    return {"parsed": actions, "applied": apply_actions(actions)}
 
 # =========================
 # FastAPI
@@ -345,6 +328,11 @@ class ScheduleRequest(BaseModel):
 def build_schedule_ep(req: ScheduleRequest):
     build_schedule_api(req.week_start)
     return {"ok": True, "assigned": len(DB["assignments"])}
+
+@app.post("/nlp")
+def nlp_apply(req: dict = None):
+    text = (req or {}).get("text", "")
+    return handle_instruction_text(text)
 
 @app.get("/calendar.ics")
 def calendar_ics():
@@ -385,14 +373,7 @@ async def upload_audio(file: UploadFile = File(...)):
     result = handle_instruction_text(transcript)
     return JSONResponse({"transcript": transcript, "result": result})
 
-# --- NLP direct: phrase(s) -> actions -> application
-class NLPRequest(BaseModel):
-    text: str = Field(..., description="Consignes en français")
-@app.post("/nlp")
-def nlp_apply(req: NLPRequest):
-    return handle_instruction_text(req.text)
-
-# --- debug
+# debug
 @app.get("/state")
 def state():
     return {
