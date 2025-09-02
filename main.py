@@ -133,16 +133,20 @@ def build_schedule(employees: List[Employee],
     model = cp_model.CpModel()
     x = {(ei, si): model.NewBoolVar(f"x_{ei}_{si}") for ei in E for si in S}
 
-    # 1 personne par shift
+    # <= 1 personne par shift (et non ==1)
     for si in S:
-        model.Add(sum(x[(ei, si)] for ei in E) == 1)
+        model.Add(sum(x[(ei, si)] for ei in E) <= 1)
 
     # Interdictions (role/dispo)
     for (ei, si), allowed in can_work.items():
         if not allowed:
             model.Add(x[(ei, si)] == 0)
 
-    # Objectif d’équité: minimise (max_heures - min_heures)
+    # Objectif principal : maximiser le nombre de shifts couverts
+    total_assigned = model.NewIntVar(0, len(shifts), "total_assigned")
+    model.Add(total_assigned == sum(x[(ei, si)] for ei in E for si in S))
+
+    # Objectif secondaire (équité) : on l’ajoute avec une petite pénalité
     mins = [shift_duration_min(shifts[si]) for si in S]
     minutes_by_emp = []
     for ei in E:
@@ -155,7 +159,12 @@ def build_schedule(employees: List[Employee],
     min_h = model.NewIntVar(0, 7*24*60, "min_h")
     model.AddMaxEquality(max_h, minutes_by_emp)
     model.AddMinEquality(min_h, minutes_by_emp)
-    model.Minimize(max_h - min_h)
+    spread = model.NewIntVar(0, 7*24*60, "spread")
+    model.Add(spread == max_h - min_h)
+
+    # Maximize total_assigned en priorité, puis équité (pénaliser spread)
+    # (poids 1000 pour être sûr que couvrir un shift vaut plus que l'équité)
+    model.Maximize(total_assigned * 1000 - spread)
 
     solver = cp_model.CpSolver()
     solver.parameters.max_time_in_seconds = 5
