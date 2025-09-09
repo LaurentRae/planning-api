@@ -189,24 +189,37 @@ def build_schedule_api(week_start: str):
 # =========================
 # Assistant NLP
 # =========================
-SYSTEM_PROMPT = """You are a planning assistant for an API.
-Always return a valid JSON object strictly following this schema:
-...
+SYSTEM_PROMPT = """
+You are a scheduling assistant for an API.
+Return ONLY a valid JSON object following this schema:
+
+{
+  "employees": [ { "first_name":"Prénom", "roles":["service"], "max_hours_per_week":40, "min_rest_hours":11 } ],
+  "availability": [ { "first_name":"Prénom", "slots_by_date": { "YYYY-MM-DD": [["HH:MM","HH:MM"]] } } ],
+  "recurring": [ {
+     "first_name":"Prénom",
+     "week_start":"YYYY-MM-DD",
+     "include": { "AM": true/false, "PM": true/false, "days": ["mon","tue","wed","thu","fri","sat","sun"] },
+     "except_days": ["fri","sat"]
+  } ],
+  "swap": [ { "date":"YYYY-MM-DD", "slot":"AM|PM", "out":"Prénom", "in":"Prénom" } ],
+  "build_schedule": { "week_start":"YYYY-MM-DD" }
+}
+
+Rules:
+- Always answer in pure JSON (no text outside).
+- JSON must always be well-formed.
+- AM = 08:00–12:00, PM = 13:00–17:00.
+- Respect closures: Monday AM closed, Wednesday PM closed.
+
+Examples:
+- "XX dispo tous les matins sauf vendredi, semaine du 8 sept" =>
+  {"recurring":[{"first_name":"XX","week_start":"2025-09-08","include":{"AM":true,"PM":false,"days":["mon","tue","wed","thu","fri","sat","sun"]},"except_days":["fri"]}],"build_schedule":{"week_start":"2025-09-08"}}
+- "remplace XX par YY le jeudi après-midi semaine du 8 sept" =>
+  {"swap":[{"date":"2025-09-11","slot":"PM","out":"XX","in":"YY"}],"build_schedule":{"week_start":"2025-09-08"}}
+- "ajoute ZZ à l'équipe" =>
+  {"employees":[{"first_name":"ZZ","roles":["service"]}]}
 """
-def gpt_extract_actions(text: str) -> dict:
-    import openai
-    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[{"role":"system","content":SYSTEM_PROMPT},{"role":"user","content":text}],
-        temperature=0
-    )
-    content = resp.choices[0].message.content
-    try:
-        return json.loads(content)
-    except Exception:
-        return {"employees": [], "availability": [], "recurring": [], "swap": [], "build_schedule": None}
 
 # (fonctions expand_recurring, apply_actions, handle_instruction_text restent inchangées)
 
