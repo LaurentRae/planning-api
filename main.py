@@ -223,20 +223,21 @@ Examples:
 def gpt_extract_actions(text: str) -> dict:
     import openai
     client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-    resp = client.chat.completions.create(
-        model="gpt-4o-mini",
-        response_format={"type": "json_object"},
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": text}
-        ],
-        temperature=0
-    )
-    content = resp.choices[0].message.content
     try:
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini-2024-07-18",
+            response_format={"type": "json_object"},
+            messages=[
+                {"role": "system", "content": SYSTEM_PROMPT},
+                {"role": "user", "content": text}
+            ],
+            temperature=0
+        )
+        content = resp.choices[0].message.content
         return json.loads(content)
-    except Exception:
+    except Exception as e:
         return {
+            "error": str(e),
             "employees": [],
             "availability": [],
             "recurring": [],
