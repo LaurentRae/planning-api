@@ -188,8 +188,10 @@ def build_schedule_api(week_start: str):
 # =========================
 # Assistant NLP
 # =========================
-SYSTEM_PROMPT = """... (inchangé) ..."""
-
+SYSTEM_PROMPT = """You are a planning assistant for an API.
+Always return a valid JSON object strictly following this schema:
+...
+"""
 def gpt_extract_actions(text: str) -> dict:
     import openai
     client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
