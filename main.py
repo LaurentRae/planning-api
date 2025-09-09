@@ -185,6 +185,7 @@ def build_schedule_api(week_start: str):
     assignments = build_schedule(DB["employees"], DB["avail"], shifts)
     DB["assignments_by_week"][week_start] = assignments
 
+
 # =========================
 # Assistant NLP
 # =========================
