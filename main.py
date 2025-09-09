@@ -185,7 +185,6 @@ def build_schedule_api(week_start: str):
     assignments = build_schedule(DB["employees"], DB["avail"], shifts)
     DB["assignments_by_week"][week_start] = assignments
 
-
 # =========================
 # Assistant NLP
 # =========================
@@ -221,7 +220,29 @@ Examples:
   {"employees":[{"first_name":"ZZ","roles":["service"]}]}
 """
 
-# (fonctions expand_recurring, apply_actions, handle_instruction_text restent inchangées)
+def gpt_extract_actions(text: str) -> dict:
+    import openai
+    client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    resp = client.chat.completions.create(
+        model="gpt-4o-mini",
+        response_format={"type": "json_object"},
+        messages=[
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": text}
+        ],
+        temperature=0
+    )
+    content = resp.choices[0].message.content
+    try:
+        return json.loads(content)
+    except Exception:
+        return {
+            "employees": [],
+            "availability": [],
+            "recurring": [],
+            "swap": [],
+            "build_schedule": None
+        }
 
 def expand_recurring(rule: dict) -> Dict[str, List[List[str]]]:
     week_start = rule["week_start"]
@@ -274,7 +295,6 @@ def apply_actions(actions: dict) -> dict:
 def handle_instruction_text(text: str) -> dict:
     actions = gpt_extract_actions(text)
     return {"parsed": actions, "applied": apply_actions(actions)}
-
 
 # =========================
 # FastAPI
