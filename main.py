@@ -347,3 +347,7 @@ def state():
         "avail": DB["avail"],
         "weeks": {k: len(v) for k, v in DB["assignments_by_week"].items()}
     }
+
+@app.get("/debug_key")
+def debug_key():
+    return {"has_key": bool(os.getenv("OPENAI_API_KEY"))}
