@@ -207,6 +207,59 @@ def gpt_extract_actions(text: str) -> dict:
 
 # (fonctions expand_recurring, apply_actions, handle_instruction_text restent inchangées)
 
+def expand_recurring(rule: dict) -> Dict[str, List[List[str]]]:
+    week_start = rule["week_start"]
+    include = rule.get("include", {})
+    include_am = bool(include.get("AM", False))
+    include_pm = bool(include.get("PM", False))
+    days = include.get("days", DOW)
+    except_days = set(rule.get("except_days", []))
+
+    slots: Dict[str, List[List[str]]] = {}
+    for i, date_iso in enumerate(week_dates(week_start)):
+        dow = DOW[i]
+        if dow in except_days or dow not in days:
+            continue
+        if include_am and is_open(date_iso, "AM"):
+            add_slot(slots, date_iso, AM_START, AM_END)
+        if include_pm and is_open(date_iso, "PM"):
+            add_slot(slots, date_iso, PM_START, PM_END)
+    return slots
+
+def apply_actions(actions: dict) -> dict:
+    for emp in actions.get("employees", []) or []:
+        if "roles" not in emp or not emp["roles"]:
+            emp["roles"] = ["service"]
+        add_or_replace_employee(Employee(**emp))
+
+    for av in actions.get("availability", []) or []:
+        DB["avail"][av["first_name"]] = av["slots_by_date"]
+
+    for ru in actions.get("recurring", []) or []:
+        name = ru["first_name"]
+        expanded = expand_recurring(ru)
+        cur = DB["avail"].get(name, {})
+        for d, slots in expanded.items():
+            cur.setdefault(d, [])
+            for s in slots:
+                if s not in cur[d]:
+                    cur[d].append(s)
+        DB["avail"][name] = cur
+
+    if actions.get("build_schedule"):
+        week_start = actions["build_schedule"]["week_start"]
+        build_schedule_api(week_start)
+        built = {"assigned": len(DB["assignments_by_week"][week_start]), "week_start": week_start}
+    else:
+        built = None
+
+    return {"ok": True, "built": built}
+
+def handle_instruction_text(text: str) -> dict:
+    actions = gpt_extract_actions(text)
+    return {"parsed": actions, "applied": apply_actions(actions)}
+
+
 # =========================
 # FastAPI
 # =========================
